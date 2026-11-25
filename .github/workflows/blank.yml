@@ -19,8 +19,7 @@ on:
     - cron: '0 3 * * 1'
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
   group: translate-ts
@@ -59,15 +58,16 @@ jobs:
         id: translate
         run: python .github/scripts/translate_ts.py
 
-      - name: Open pull request with translations
+      - name: Collect changed .ts files
         if: steps.translate.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        run: |
+          mkdir -p /tmp/translated
+          git diff --name-only -z -- '*.ts' | xargs -0 -I{} cp --parents {} /tmp/translated/
+          find /tmp/translated -type f
+
+      - name: Upload translated files
+        if: steps.translate.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
         with:
-          add-paths: '**/*.ts'
-          branch: i18n/auto-translate
-          delete-branch: true
-          commit-message: 'chore(i18n): machine-translate .ts files'
-          title: 'chore(i18n): machine-translated strings'
-          body: |
-            Automated NLLB translations (`${{ env.MODEL_NAME }}`).
-            Strings are left `unfinished` unless `mark_finished` was set, so they show up for review in Qt Linguist.
+          name: translated-ts-files
+          path: /tmp/translated
