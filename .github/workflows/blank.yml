@@ -4,156 +4,70 @@ on:
   workflow_dispatch:
     inputs:
       target_language:
-        description: 'Target language code (e.g., fr, es, de)'
-        required: true
-        default: 'fr'
+        description: 'Only this language (e.g. fr, de, pt_BR). Empty = every language found in the .ts files'
+        required: false
+        default: ''
       model_name:
         description: 'Hugging Face model for translation'
         required: false
         default: 'facebook/nllb-200-distilled-600M'
+      mark_finished:
+        description: 'Mark machine translations as finished (default: leave as unfinished for review)'
+        type: boolean
+        default: false
   schedule:
     - cron: '0 3 * * 1'
 
 permissions:
   contents: write
+  pull-requests: write
+
+concurrency:
+  group: translate-ts
+  cancel-in-progress: false
 
 jobs:
   translate:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     env:
       HF_HOME: /tmp/hf_cache
-      TRANSFORMERS_OFFLINE: "0"
+      # inputs.* is empty on scheduled runs, so every value needs a fallback
+      MODEL_NAME: ${{ inputs.model_name || 'facebook/nllb-200-distilled-600M' }}
+      TARGET_LANG: ${{ inputs.target_language || '' }}
+      MARK_FINISHED: ${{ inputs.mark_finished == true && 'true' || 'false' }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: Cache Hugging Face model
         uses: actions/cache@v4
         with:
-          path: |
-            /tmp/hf_cache
-            ~/.cache/huggingface
-          key: ${{ runner.os }}-hf-${{ hashFiles('**/requirements.txt') }}-${{ inputs.model_name }}
-          restore-keys: |
-            ${{ runner.os }}-hf-
+          path: /tmp/hf_cache
+          key: hf-${{ env.MODEL_NAME }}
 
-      - name: Install dependencies
+      - name: Install dependencies (CPU-only torch)
         run: |
           pip install --upgrade pip
-          pip install transformers torch lxml tqdm
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers sentencepiece lxml
 
-      - name: Run translation script
+      - name: Translate
         id: translate
-        env:
-          TARGET_LANG: ${{ inputs.target_language }}
-          MODEL_NAME: ${{ inputs.model_name }}
-        run: |
-          python - <<'PY'
-          import os, re, sys
-          from pathlib import Path
-          from lxml import etree
-          from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-          from tqdm import tqdm
-          import torch
+        run: python .github/scripts/translate_ts.py
 
-          # ---------- configuration ----------
-          TS_GLOB   = "**/*.ts"
-          TARGET    = os.getenv("TARGET_LANG", "fr")
-          MODEL     = os.getenv("MODEL_NAME", "facebook/nllb-200-distilled-600M")
-          SUMMARY   = os.getenv("GITHUB_STEP_SUMMARY")
-
-          # ---------- load model ----------
-          tokenizer = AutoTokenizer.from_pretrained(MODEL)
-          model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
-          model.eval()
-          target_id = tokenizer.convert_tokens_to_ids(f"{TARGET}_Latn")
-
-          # ---------- helpers ----------
-          def translate_text(text):
-              """Translate while protecting placeholders and markup."""
-              protected = {}
-              def mask(m):
-                  k = f"__P{len(protected)}__"
-                  protected[k] = m.group(0)
-                  return k
-              masked = re.sub(r'(%[0-9]+|%n|&[a-zA-Z]|&#?\w+;|<[^>]+>)', mask, text)
-
-              inputs = tokenizer(masked, return_tensors="pt", max_length=512, truncation=True)
-              with torch.inference_mode():
-                  out = model.generate(
-                      **inputs,
-                      forced_bos_token_id=target_id,
-                      max_new_tokens=512,
-                  )
-              result = tokenizer.decode(out[0], skip_special_tokens=True)
-              for k, v in protected.items():
-                  result = result.replace(k, v)
-              return result
-
-          def progress(msg, file):
-              line = f"- `{file}`: {msg}"
-              print(line)
-              if SUMMARY:
-                  with open(SUMMARY, "a", encoding="utf-8") as f:
-                      f.write(line + "\n")
-
-          # ---------- main ----------
-          ts_files = list(Path(".").glob(TS_GLOB))
-          if not ts_files:
-              progress("No .ts files found", "—")
-              sys.exit(0)
-
-          total_translated = 0
-          for ts_path in ts_files:
-              tree = etree.parse(str(ts_path))
-              root = tree.getroot()
-              messages = root.findall('.//message')
-              pending = [m for m in messages
-                         if (m.find('translation') is None or
-                             not m.findtext('translation') or
-                             m.find('translation').get('type') == 'unfinished')]
-
-              if not pending:
-                  progress("0 strings (all done)", ts_path.name)
-                  continue
-
-              print(f"::group::Translating {ts_path.name} ({len(pending)} strings)")
-              for msg in tqdm(pending, desc=ts_path.name, unit="str", file=sys.stdout):
-                  src = msg.findtext('source')
-                  if not src:
-                      continue
-                  tr_node = msg.find('translation')
-                  if tr_node is None:
-                      tr_node = etree.SubElement(msg, 'translation')
-                  tr_node.text = translate_text(src)
-                  tr_node.set('type', 'finished')
-
-              tree.write(str(ts_path), encoding='utf-8',
-                         xml_declaration=True, pretty_print=True)
-              print("::endgroup::")
-              progress(f"{len(pending)} strings translated", ts_path.name)
-              total_translated += len(pending)
-
-          if SUMMARY:
-              with open(SUMMARY, "a", encoding="utf-8") as f:
-                  f.write(f"\n**✅ Total strings translated: {total_translated}**\n")
-          print(f"Done – {total_translated} strings translated across {len(ts_files)} files.")
-          PY
-
-      - name: Upload translated files
-        uses: actions/upload-artifact@v4
+      - name: Open pull request with translations
+        if: steps.translate.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
         with:
-          name: translated-ts-files
-          path: '**/*.ts'
-
-      # Optional: auto-commit the changes
-      # - name: Commit and push
-      #   uses: stefanzweifel/git-auto-commit-action@v5
-      #   with:
-      #     commit_message: "chore(i18n): auto-translate .ts files (${{ inputs.target_language }})"
-      #     file_pattern: '**/*.ts'   
+          add-paths: '**/*.ts'
+          branch: i18n/auto-translate
+          delete-branch: true
+          commit-message: 'chore(i18n): machine-translate .ts files'
+          title: 'chore(i18n): machine-translated strings'
+          body: |
+            Automated NLLB translations (`${{ env.MODEL_NAME }}`).
+            Strings are left `unfinished` unless `mark_finished` was set, so they show up for review in Qt Linguist.
