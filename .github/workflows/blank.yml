@@ -12,17 +12,17 @@ on:
         required: false
         default: 'facebook/nllb-200-distilled-600M'
   schedule:
-    - cron: '0 3 * * 1'   # every Monday at 03:00 UTC – optional
+    - cron: '0 3 * * 1'
 
 permissions:
-  contents: write          # needed if you want to auto‑commit changes
+  contents: write
 
 jobs:
   translate:
     runs-on: ubuntu-latest
     env:
       HF_HOME: /tmp/hf_cache
-      TRANSFORMERS_OFFLINE: "0"   # set to 1 if you pre‑download the model
+      TRANSFORMERS_OFFLINE: "0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -57,17 +57,24 @@ jobs:
           import os, re, sys
           from pathlib import Path
           from lxml import etree
-          from transformers import pipeline
+          from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
           from tqdm import tqdm
+          import torch
 
           # ---------- configuration ----------
-          TS_GLOB   = "**/*.ts"               # adjust if your .ts files live elsewhere
+          TS_GLOB   = "**/*.ts"
           TARGET    = os.getenv("TARGET_LANG", "fr")
           MODEL     = os.getenv("MODEL_NAME", "facebook/nllb-200-distilled-600M")
           SUMMARY   = os.getenv("GITHUB_STEP_SUMMARY")
 
+          # ---------- load model ----------
+          tokenizer = AutoTokenizer.from_pretrained(MODEL)
+          model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
+          model.eval()
+          target_id = tokenizer.convert_tokens_to_ids(f"{TARGET}_Latn")
+
           # ---------- helpers ----------
-          def translate_text(text, translator):
+          def translate_text(text):
               """Translate while protecting placeholders and markup."""
               protected = {}
               def mask(m):
@@ -75,13 +82,20 @@ jobs:
                   protected[k] = m.group(0)
                   return k
               masked = re.sub(r'(%[0-9]+|%n|&[a-zA-Z]|&#?\w+;|<[^>]+>)', mask, text)
-              out = translator(masked, max_length=512)[0]['translation_text']
+
+              inputs = tokenizer(masked, return_tensors="pt", max_length=512, truncation=True)
+              with torch.inference_mode():
+                  out = model.generate(
+                      **inputs,
+                      forced_bos_token_id=target_id,
+                      max_new_tokens=512,
+                  )
+              result = tokenizer.decode(out[0], skip_special_tokens=True)
               for k, v in protected.items():
-                  out = out.replace(k, v)
-              return out
+                  result = result.replace(k, v)
+              return result
 
           def progress(msg, file):
-              """Write a line to the step summary and the log."""
               line = f"- `{file}`: {msg}"
               print(line)
               if SUMMARY:
@@ -89,9 +103,6 @@ jobs:
                       f.write(line + "\n")
 
           # ---------- main ----------
-          translator = pipeline("translation", model=MODEL,
-                                src_lang="eng_Latn", tgt_lang=f"{TARGET}_Latn")
-
           ts_files = list(Path(".").glob(TS_GLOB))
           if not ts_files:
               progress("No .ts files found", "—")
@@ -102,7 +113,6 @@ jobs:
               tree = etree.parse(str(ts_path))
               root = tree.getroot()
               messages = root.findall('.//message')
-              # select only unfinished / empty translations
               pending = [m for m in messages
                          if (m.find('translation') is None or
                              not m.findtext('translation') or
@@ -120,7 +130,7 @@ jobs:
                   tr_node = msg.find('translation')
                   if tr_node is None:
                       tr_node = etree.SubElement(msg, 'translation')
-                  tr_node.text = translate_text(src, translator)
+                  tr_node.text = translate_text(src)
                   tr_node.set('type', 'finished')
 
               tree.write(str(ts_path), encoding='utf-8',
@@ -141,9 +151,9 @@ jobs:
           name: translated-ts-files
           path: '**/*.ts'
 
-      # Optional: auto‑commit the changes
+      # Optional: auto-commit the changes
       # - name: Commit and push
       #   uses: stefanzweifel/git-auto-commit-action@v5
       #   with:
-      #     commit_message: "chore(i18n): auto‑translate .ts files (${{ inputs.target_language }})"
-      #     file_pattern: '**/*.ts'
+      #     commit_message: "chore(i18n): auto-translate .ts files (${{ inputs.target_language }})"
+      #     file_pattern: '**/*.ts'   
